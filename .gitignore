@@ -1,0 +1,41 @@
+# Gradle
+.gradle/
+build/
+
+# Java compiled output
+*.class
+*.jar
+*.war
+*.ear
+*.nar
+!gradle/wrapper/gradle-wrapper.jar
+out/
+
+# IntelliJ IDEA
+.idea/
+*.iml
+*.iws
+*.ipr
+
+# Eclipse
+.project
+.classpath
+.settings/
+bin/
+
+# VS Code
+.vscode/
+
+# NetBeans
+nbproject/
+nbbuild/
+dist/
+nbdist/
+
+# macOS / Windows
+.DS_Store
+Thumbs.db
+
+# Crash logs
+hs_err_pid*
+replay_pid*

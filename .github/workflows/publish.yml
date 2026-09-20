@@ -1,0 +1,28 @@
+name: Publish
+
+# Manual release: GitHub Packages rejects re-uploads of an existing version,
+# so publishing is explicit rather than per-push. Bump the version in
+# gradle.properties first, then run this workflow.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+      - uses: gradle/actions/setup-gradle@v4
+      - name: Publish to GitHub Packages
+        run: |
+          chmod +x gradlew
+          ./gradlew publish
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
