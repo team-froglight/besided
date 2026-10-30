@@ -1,41 +1,28 @@
 # Gradle
 .gradle/
 build/
-
-# Java compiled output
-*.class
-*.jar
-*.war
-*.ear
-*.nar
 !gradle/wrapper/gradle-wrapper.jar
-out/
 
-# IntelliJ IDEA
+# Dev runs
+run/
+runs/
+runServer/
+
+# IDEs
 .idea/
 *.iml
-*.iws
 *.ipr
-
-# Eclipse
+*.iws
+out/
+.vscode/
 .project
 .classpath
 .settings/
 bin/
 
-# VS Code
-.vscode/
-
-# NetBeans
-nbproject/
-nbbuild/
-dist/
-nbdist/
-
-# macOS / Windows
+# OS and crash logs
 .DS_Store
 Thumbs.db
-
-# Crash logs
+*.log
 hs_err_pid*
 replay_pid*
