@@ -222,5 +222,5 @@ no call to `Sided` itself is left in the side jars.
 - Metadata file in jars: `META-INF/sidedjar.json` → `META-INF/besided.json`.
 - Side marker in jars: `META-INF/sidedjar-side` → `META-INF/besided-side`
   (contents unchanged: `client` / `server`).
-- Task names are unchanged: `stripClient`, `stripServer`, `buildClient`, `buildServer`,
-  `generateSidedMeta`.
+- Task names: `stripClient`, `stripServer`, `buildClient` and `buildServer` are unchanged;
+  `generateSidedMeta` → `generateBesidedMeta`.
