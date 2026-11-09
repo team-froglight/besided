@@ -29,6 +29,20 @@ Intermediate stripped classes are written under `build/besided/client/` and `bui
 supported outputs. Strip-only tasks `stripClient`/`stripServer` populate those directories
 without packaging.
 
+### The annotations and `Sided`
+
+`@ClientSide`, `@ServerSide` and the rest, and the `Sided` helper, are in a small jar of their
+own, `me.methodial:besided-api`. The plugin carries a copy and adds it to every project that
+applies it (with the `java` plugin) as an `implementation` file dependency, so there is nothing
+to declare and no repository to add. A file dependency is never published, so your POM doesn't
+gain it.
+
+The side jars don't need it at runtime: every `Sided` call is rewritten while stripping, and the
+annotations have `CLASS` retention. Untransformed classes do call `Sided` (dev runs, tests, the
+plain `jar`): it is on the runtime classpath there, but if you ship the plain jar, ship
+`besided-api` with it. A Minecraft loader's dev run may want it on its own classpath (for
+example ModDevGradle's `additionalRuntimeClasspath`).
+
 ## DSL
 
 ```gradle

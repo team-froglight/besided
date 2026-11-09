@@ -1,6 +1,15 @@
 package me.methodial.besided.gradle;
 
+import java.io.File;
+import java.io.IOException;
+import java.io.InputStream;
 import java.lang.reflect.Method;
+import java.nio.file.AtomicMoveNotSupportedException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.StandardCopyOption;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
 import java.util.Arrays;
 
 import me.methodial.besided.api.RemovalMode;
@@ -27,6 +36,7 @@ public class BesidedPlugin implements Plugin<Project> {
     @Override
     public void apply(Project project) {
         BesidedExtension extension = project.getExtensions().create("besided", BesidedExtension.class);
+        project.getPluginManager().withPlugin("java", java -> addApi(project));
         // Deliberately no convention on stripFrom: an unset value means "auto-detect" (see afterEvaluate).
 
         TaskProvider<StripTask> stripClient = project.getTasks().register("stripClient", StripTask.class, task -> {
@@ -194,6 +204,80 @@ public class BesidedPlugin implements Plugin<Project> {
             meta.configure(task -> task.getInputFiles().setFrom(Arrays.asList(classesDirs)));
         } catch (Exception ignored) {
             // Keep the layout defaults set at registration time.
+        }
+    }
+
+    /** Where the besided-api jar sits inside this plugin's own jar. */
+    private static final String API_RESOURCE = "/me/methodial/besided/besided-api.jar";
+
+    /**
+     * Puts the annotations and {@code Sided} on the project's classpath, from the copy this
+     * plugin carries, so code can use them without a repository for besided. It is added as
+     * {@code implementation} because untransformed classes (dev runs, tests, the universal
+     * jar) call {@code Sided} at runtime; the side jars never do, since every call is
+     * rewritten. A file dependency is never published, so the project's POM doesn't gain it.
+     */
+    private static void addApi(Project project) {
+        File jar = extractApi(project.getGradle().getGradleUserHomeDir());
+        project.getDependencies().add("implementation", project.files(jar));
+    }
+
+    /**
+     * The embedded jar, copied once into the Gradle user home under a name made from its
+     * content (so a new plugin version gets a new file, and an existing file is never
+     * rewritten while another build reads it).
+     */
+    private static File extractApi(File gradleUserHome) {
+        byte[] bytes;
+        try (InputStream in = BesidedPlugin.class.getResourceAsStream(API_RESOURCE)) {
+            if (in == null) {
+                throw new GradleException("besided: " + API_RESOURCE + " is missing from the plugin jar");
+            }
+            bytes = in.readAllBytes();
+        } catch (IOException e) {
+            throw new GradleException("besided: couldn't read " + API_RESOURCE, e);
+        }
+        File out = new File(gradleUserHome, "caches/besided/besided-api-" + shortHash(bytes) + ".jar");
+        if (out.isFile() && out.length() == bytes.length) {
+            return out;
+        }
+        Path temp = null;
+        try {
+            Files.createDirectories(out.getParentFile().toPath());
+            temp = Files.createTempFile(out.getParentFile().toPath(), "besided-api", ".tmp");
+            Files.write(temp, bytes);
+            try {
+                Files.move(temp, out.toPath(), StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
+            } catch (AtomicMoveNotSupportedException e) {
+                Files.move(temp, out.toPath(), StandardCopyOption.REPLACE_EXISTING);
+            }
+        } catch (IOException e) {
+            // Another build may have just written the same file.
+            if (!(out.isFile() && out.length() == bytes.length)) {
+                throw new GradleException("besided: couldn't write " + out, e);
+            }
+        } finally {
+            if (temp != null) {
+                try {
+                    Files.deleteIfExists(temp);
+                } catch (IOException ignored) {
+                    // Left behind in the cache directory; harmless.
+                }
+            }
+        }
+        return out;
+    }
+
+    private static String shortHash(byte[] bytes) {
+        try {
+            byte[] digest = MessageDigest.getInstance("SHA-256").digest(bytes);
+            StringBuilder hex = new StringBuilder();
+            for (int i = 0; i < 8; i++) {
+                hex.append(String.format("%02x", digest[i]));
+            }
+            return hex.toString();
+        } catch (NoSuchAlgorithmException e) {
+            throw new IllegalStateException(e);
         }
     }
 

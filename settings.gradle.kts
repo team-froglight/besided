@@ -10,3 +10,5 @@ plugins {
 }
 
 rootProject.name = "besided"
+
+include("besided-api")

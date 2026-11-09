@@ -630,6 +630,49 @@ public class BesidedFunctionalTest {
     }
 
     @Test
+    void pluginAloneProvidesTheAnnotationsAndSided() throws Exception {
+        writeSettings();
+        // No classpath injected: what the code compiles against comes from the plugin itself.
+        writeFile(testProjectDir.resolve("build.gradle"), """
+                plugins {
+                    id 'java'
+                    id 'me.methodial.besided'
+                }
+                """);
+
+        Path src = testProjectDir.resolve("src/main/java/com/example");
+        writeFile(src.resolve("Machine.java"), """
+                package com.example;
+                import me.methodial.besided.annotations.ClientSide;
+                import me.methodial.besided.runtime.Sided;
+                public class Machine {
+                    @ClientSide public String texture() { return "machine.png"; }
+                    public String describe() {
+                        Runnable noop = () -> { };
+                        Sided.runServer(noop);
+                        return Sided.getClient(() -> texture(), "no texture");
+                    }
+                }
+                """);
+
+        runBuild("buildClient", "buildServer");
+
+        byte[] server = readClassBytes("server", "com/example/Machine.class");
+        byte[] client = readClassBytes("client", "com/example/Machine.class");
+        assertFalse(inspect(server).methods.contains("texture"), "@ClientSide still strips");
+        assertFalse(callsSided(server), "the server jar needs no Sided at runtime");
+        assertFalse(callsSided(client), "the client jar needs no Sided at runtime");
+        assertFalse(resourceExists("server", "me/methodial/besided/runtime/Sided.class"),
+                "the API is not copied into the side jars");
+        // Loaded with no besided classes around at all: only the JDK's.
+        URL dir = testProjectDir.resolve("build/besided/server").toUri().toURL();
+        try (URLClassLoader loader = new URLClassLoader(new URL[]{dir}, ClassLoader.getPlatformClassLoader())) {
+            Class<?> machine = Class.forName("com.example.Machine", true, loader);
+            assertEquals("no texture", machine.getMethod("describe").invoke(machine.getDeclaredConstructor().newInstance()));
+        }
+    }
+
+    @Test
     void sideMarkerContainsSideName() throws Exception {
         writeSettings();
         writeBuild("");

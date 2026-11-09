@@ -23,13 +23,23 @@ configurations.named("implementation") {
     extendsFrom(shaded)
 }
 
+// The besided-api jar (annotations and Sided), carried inside the plugin as a resource: the
+// plugin adds it to every project that applies it (BesidedPlugin), so consumers can compile
+// against it without a repository of their own for it.
+val embeddedApi = configurations.create("embeddedApi") {
+    isCanBeConsumed = false
+    isTransitive = false
+}
+
 dependencies {
     add("shaded", "org.ow2.asm:asm:9.10.1")
     add("shaded", "org.ow2.asm:asm-commons:9.10.1")
     add("shaded", "org.ow2.asm:asm-util:9.10.1")
+    add("embeddedApi", project(":besided-api"))
 
     compileOnly(gradleApi())
 
+    testImplementation(project(":besided-api"))
     testImplementation(gradleTestKit())
     testImplementation("org.junit.jupiter:junit-jupiter:5.10.0")
     testRuntimeOnly("org.junit.platform:junit-platform-launcher")
@@ -94,6 +104,13 @@ publishing {
                 password = providers.gradleProperty("gpr.key").orElse(providers.environmentVariable("GITHUB_TOKEN")).getOrElse("")
             }
         }
+    }
+}
+
+tasks.named<ProcessResources>("processResources") {
+    from(embeddedApi) {
+        into("me/methodial/besided")
+        rename { "besided-api.jar" }
     }
 }
 
