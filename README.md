@@ -163,8 +163,11 @@ public void onUpdate() {
 | `getClient(s, def)` | supplier value | `def` |
 | `getClient(s, defSupplier)` | supplier value | value from `defSupplier` |
 
-Suppliers must be **inline lambdas at the call site**. Passing a variable or method reference
-falls back to a safe interface call and the opposite-side code stays in the jar.
+Suppliers should be **inline lambdas at the call site**: only those are inlined, and only their
+bodies are removed from the other jar. Anything else (a variable, a method or constructor
+reference) falls back to a safe interface call, `Runnable.run()` / `Supplier.get()`, on its own
+side, and is computed but not run on the other; what it points at stays in both jars. Either way
+no call to `Sided` itself is left in the side jars.
 
 ## How it works
 
@@ -191,7 +194,9 @@ falls back to a safe interface call and the opposite-side code stays in the jar.
   whether surviving code still refers to it. A common class calling a removed member fails at
   runtime with `NoSuchFieldError` / `NoSuchMethodError`. Mark callers sided too.
 - **Inline lambdas only.** `Sided.*` suppliers written as stored variables or method references are
-  not inlined; opposite-side code then survives. Always pass the lambda directly at the call site.
+  not inlined; the code they point at survives in the opposite jar (a method reference's target is
+  an ordinary method, which other code may call). Pass the lambda directly at the call site, or
+  mark the target method sided.
 
 ## Migration from sidedjar
 

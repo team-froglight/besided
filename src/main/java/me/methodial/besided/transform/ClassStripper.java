@@ -88,7 +88,7 @@ public final class ClassStripper {
                 hollow(method);
             }
             dropStrippedFieldStores(cn.name, method, hierarchy, mode);
-            if (SidedInliner.inline(method, hierarchy, mode, synth)) {
+            if (SidedInliner.inline(cn, method, hierarchy, mode, synth)) {
                 framesNeeded = true;
             }
         }

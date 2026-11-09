@@ -1,6 +1,8 @@
 package me.methodial.besided.transform;
 
+import java.util.HashSet;
 import java.util.Map;
+import java.util.Set;
 import me.methodial.besided.api.RemovalMode;
 import me.methodial.besided.scan.Hierarchy;
 import me.methodial.besided.util.Descriptors;
@@ -8,6 +10,7 @@ import org.objectweb.asm.Handle;
 import org.objectweb.asm.Opcodes;
 import org.objectweb.asm.Type;
 import org.objectweb.asm.tree.AbstractInsnNode;
+import org.objectweb.asm.tree.ClassNode;
 import org.objectweb.asm.tree.InsnNode;
 import org.objectweb.asm.tree.InvokeDynamicInsnNode;
 import org.objectweb.asm.tree.JumpInsnNode;
@@ -17,6 +20,7 @@ import org.objectweb.asm.tree.MethodInsnNode;
 import org.objectweb.asm.tree.MethodNode;
 import org.objectweb.asm.tree.MultiANewArrayInsnNode;
 import org.objectweb.asm.tree.TableSwitchInsnNode;
+import org.objectweb.asm.tree.TryCatchBlockNode;
 import org.objectweb.asm.tree.FieldInsnNode;
 import org.objectweb.asm.tree.IntInsnNode;
 import org.objectweb.asm.tree.LdcInsnNode;
@@ -25,11 +29,16 @@ import org.objectweb.asm.tree.LdcInsnNode;
  * Rewrites {@code Sided.*} calls inside one method.
  *
  * <p>Covers all ten helpers: {@code isClient/isServer}, {@code runClient/runServer},
- * and the three {@code getClient} plus three {@code getServer} overloads.
+ * and the three {@code getClient} plus three {@code getServer} overloads. No call to
+ * {@code Sided} is left behind, so neither side jar needs it at runtime.
  *
- * <p>Lambda (invokedynamic) arguments are inlined to direct calls on the kept side
- * and erased on the removed side. Non-lambda arguments have no erasure shape that
- * is always safe, so they are left untouched.
+ * <p>On the kept side, a lambda written at the call site is inlined: its synthetic body
+ * ({@code lambda$...} in the class being stripped) is called directly. Anything else (a
+ * method or constructor reference, a lambda from elsewhere, a variable) becomes the
+ * functional interface's own call, {@code Runnable.run()} or {@code Supplier.get()}, which
+ * is exactly what {@code Sided} would have done on that side. On the removed side the
+ * argument is erased: an invokedynamic together with its captured values, any other value
+ * is computed as before and popped.
  *
  * @param synthToRemove maps lambda-impl keys ({@link #implKey}: {@code owner.name+descriptor})
  *     to {@code "KEEP"} or {@code "DROP"}; keep always wins over drop. Only a synthetic method
@@ -42,26 +51,44 @@ public final class SidedInliner {
     /** Marker stored in {@code synthToRemove} for impls that can be deleted. */
     public static final String DROP = "DROP";
 
+    private static final String LAMBDA_METAFACTORY = "java/lang/invoke/LambdaMetafactory";
+
     private SidedInliner() {}
+
+    /**
+     * Inlines every {@code Sided.*} call in the method, without knowing its class: no lambda
+     * is inlined, kept calls become plain interface calls.
+     *
+     * @deprecated use {@link #inline(ClassNode, MethodNode, Hierarchy, RemovalMode, Map)}
+     */
+    @Deprecated
+    public static boolean inline(
+            MethodNode method, Hierarchy hierarchy, RemovalMode mode,
+            Map<String, String> synthToRemove) {
+        return inline(null, method, hierarchy, mode, synthToRemove);
+    }
 
     /**
      * Inlines every {@code Sided.*} call in the method.
      *
+     * @param owner the class declaring {@code method}, whose synthetic lambda bodies may be
+     *     called directly; null to inline none
      * @param hierarchy accepted for API stability; not needed for pure call rewriting
      * @return true when branches were folded and frames must be recomputed
      */
     public static boolean inline(
-            MethodNode method, Hierarchy hierarchy, RemovalMode mode,
+            ClassNode owner, MethodNode method, Hierarchy hierarchy, RemovalMode mode,
             Map<String, String> synthToRemove) {
         if (method.instructions == null || method.instructions.size() == 0) {
             return false;
         }
         boolean clientJar = mode == RemovalMode.SERVER;
+        Set<LabelNode> targets = branchTargets(method);
         AbstractInsnNode insn = method.instructions.getFirst();
         while (insn != null) {
             AbstractInsnNode next = insn.getNext();
             if (insn instanceof MethodInsnNode call && Descriptors.SIDED_OWNER.equals(call.owner)) {
-                next = rewriteCall(method, call, precedingIndy(insn), clientJar, synthToRemove);
+                next = rewriteCall(owner, method, call, precedingIndy(insn, targets), clientJar, synthToRemove);
             }
             insn = next;
         }
@@ -69,7 +96,7 @@ public final class SidedInliner {
     }
 
     private static AbstractInsnNode rewriteCall(
-            MethodNode method, MethodInsnNode call, InvokeDynamicInsnNode indy,
+            ClassNode owner, MethodNode method, MethodInsnNode call, InvokeDynamicInsnNode indy,
             boolean clientJar, Map<String, String> synth) {
         AbstractInsnNode next = call.getNext();
         switch (call.name) {
@@ -80,45 +107,21 @@ public final class SidedInliner {
                 method.instructions.set(call, new InsnNode(clientJar ? Opcodes.ICONST_0 : Opcodes.ICONST_1));
                 break;
             case "runClient":
-                if (indy != null) {
-                    if (clientJar) {
-                        keepLambda(method, indy, call, synth);
-                    } else {
-                        dropLambda(method, indy, call, synth, false);
-                    }
-                }
+                rewriteSingle(owner, method, indy, call, clientJar, synth);
                 break;
             case "runServer":
-                if (indy != null) {
-                    if (!clientJar) {
-                        keepLambda(method, indy, call, synth);
-                    } else {
-                        dropLambda(method, indy, call, synth, false);
-                    }
-                }
+                rewriteSingle(owner, method, indy, call, !clientJar, synth);
                 break;
             case "getClient":
                 if (Type.getArgumentTypes(call.desc).length == 1) {
-                    if (indy != null) {
-                        if (clientJar) {
-                            keepLambda(method, indy, call, synth);
-                        } else {
-                            dropLambda(method, indy, call, synth, true);
-                        }
-                    }
+                    rewriteSingle(owner, method, indy, call, clientJar, synth);
                 } else {
                     rewriteWithDefault(method, call, clientJar, synth);
                 }
                 break;
             case "getServer":
                 if (Type.getArgumentTypes(call.desc).length == 1) {
-                    if (indy != null) {
-                        if (!clientJar) {
-                            keepLambda(method, indy, call, synth);
-                        } else {
-                            dropLambda(method, indy, call, synth, true);
-                        }
-                    }
+                    rewriteSingle(owner, method, indy, call, !clientJar, synth);
                 } else {
                     rewriteWithDefault(method, call, !clientJar, synth);
                 }
@@ -127,6 +130,35 @@ public final class SidedInliner {
                 break;
         }
         return next;
+    }
+
+    /**
+     * One-argument {@code runX(runnable)} / {@code getX(supplier)}: kept, the argument runs;
+     * removed, it is erased ({@code getX} then gives {@code null}).
+     */
+    private static void rewriteSingle(
+            ClassNode owner, MethodNode method, InvokeDynamicInsnNode indy, MethodInsnNode call,
+            boolean keep, Map<String, String> synth) {
+        boolean returnsValue = Type.getReturnType(call.desc).getSort() != Type.VOID;
+        if (keep) {
+            Handle body = indy == null ? null : inlinableBody(owner, indy, call);
+            if (body != null) {
+                inlineLambda(method, indy, call, body, synth);
+            } else {
+                method.instructions.set(call, functionalCall(call));
+            }
+        } else if (indy != null) {
+            dropLambda(method, indy, call, synth, returnsValue);
+        } else {
+            // A Runnable or Supplier from a variable or an expression: still computed, as it
+            // was for Sided, but never run.
+            method.instructions.insertBefore(call, new InsnNode(Opcodes.POP));
+            if (returnsValue) {
+                method.instructions.set(call, new InsnNode(Opcodes.ACONST_NULL));
+            } else {
+                method.instructions.remove(call);
+            }
+        }
     }
 
     /**
@@ -165,19 +197,87 @@ public final class SidedInliner {
                 "get", "()Ljava/lang/Object;", true);
     }
 
-    private static void keepLambda(
-            MethodNode method, InvokeDynamicInsnNode indy, MethodInsnNode call,
-            Map<String, String> synth) {
+    /**
+     * The lambda body {@code indy} wraps, when it can be called in place of {@code call}: a
+     * synthetic {@code lambda$} method of this very class (static, or a private instance one,
+     * which javac reaches by invokespecial or, since JDK 15, by invokevirtual/invokeinterface),
+     * taking exactly the captured values and returning what the call does
+     * (nothing for {@code runX}, a reference for {@code getX}). Anything else (method and
+     * constructor references, whose target may need boxing, a {@code NEW}, or an interface
+     * dispatch) is null, and stays an interface call.
+     */
+    private static Handle inlinableBody(ClassNode owner, InvokeDynamicInsnNode indy, MethodInsnNode call) {
         Handle impl = lambdaImpl(indy);
-        if (impl == null) {
-            return;
+        if (owner == null || impl == null || !impl.getOwner().equals(owner.name)) {
+            return null;
         }
-        synth.put(implKey(impl), KEEP);
+        int tag = impl.getTag();
+        boolean isStatic = tag == Opcodes.H_INVOKESTATIC;
+        if (!isStatic && tag != Opcodes.H_INVOKESPECIAL && tag != Opcodes.H_INVOKEVIRTUAL
+                && tag != Opcodes.H_INVOKEINTERFACE) {
+            return null;
+        }
+        MethodNode body = findMethod(owner, impl.getName(), impl.getDesc());
+        if (body == null || (body.access & Opcodes.ACC_SYNTHETIC) == 0 || !body.name.startsWith("lambda$")
+                || ((body.access & Opcodes.ACC_STATIC) != 0) != isStatic
+                || (!isStatic && (body.access & Opcodes.ACC_PRIVATE) == 0)) {
+            return null;
+        }
+        // The indy must produce the very argument the call takes (a Runnable or a Supplier).
+        if (!Type.getReturnType(indy.desc).equals(Type.getArgumentTypes(call.desc)[0])) {
+            return null;
+        }
+        // run() and get() take nothing, so the body's parameters are the captured values,
+        // after the receiver for an instance body.
+        Type[] captured = Type.getArgumentTypes(indy.desc);
+        Type[] params = Type.getArgumentTypes(impl.getDesc());
+        int receiver = isStatic ? 0 : 1;
+        if (captured.length != params.length + receiver) {
+            return null;
+        }
+        if (receiver == 1 && !captured[0].equals(Type.getObjectType(owner.name))) {
+            return null;
+        }
+        for (int i = 0; i < params.length; i++) {
+            if (!captured[i + receiver].equals(params[i])) {
+                return null;
+            }
+        }
+        int returned = Type.getReturnType(impl.getDesc()).getSort();
+        boolean wantsValue = Type.getReturnType(call.desc).getSort() != Type.VOID;
+        boolean fits = wantsValue ? returned == Type.OBJECT || returned == Type.ARRAY : returned == Type.VOID;
+        return fits ? impl : null;
+    }
+
+    private static void inlineLambda(
+            MethodNode method, InvokeDynamicInsnNode indy, MethodInsnNode call, Handle body,
+            Map<String, String> synth) {
+        synth.put(implKey(body), KEEP);
+        // A private body is always reachable by invokespecial, whichever handle kind javac
+        // chose. A lambda in an interface (in a default or static method) has its body there
+        // too: the call must say so, or it fails with IncompatibleClassChangeError.
         MethodInsnNode direct = new MethodInsnNode(
-                tagToOpcode(impl.getTag()), impl.getOwner(), impl.getName(), impl.getDesc(),
-                impl.getTag() == Opcodes.H_INVOKEINTERFACE);
+                body.getTag() == Opcodes.H_INVOKESTATIC ? Opcodes.INVOKESTATIC : Opcodes.INVOKESPECIAL,
+                body.getOwner(), body.getName(), body.getDesc(), body.isInterface());
         method.instructions.remove(indy);
         method.instructions.set(call, direct);
+    }
+
+    /** {@code Runnable.run()} or {@code Supplier.get()} on the argument, in place of {@code call}. */
+    private static MethodInsnNode functionalCall(MethodInsnNode call) {
+        if (Type.getReturnType(call.desc).getSort() == Type.VOID) {
+            return new MethodInsnNode(Opcodes.INVOKEINTERFACE, "java/lang/Runnable", "run", "()V", true);
+        }
+        return supplierGet();
+    }
+
+    private static MethodNode findMethod(ClassNode owner, String name, String desc) {
+        for (MethodNode m : owner.methods) {
+            if (m.name.equals(name) && m.desc.equals(desc)) {
+                return m;
+            }
+        }
+        return null;
     }
 
     private static void dropLambda(
@@ -284,10 +384,18 @@ public final class SidedInliner {
         return null;
     }
 
-    private static InvokeDynamicInsnNode precedingIndy(AbstractInsnNode insn) {
+    /**
+     * The invokedynamic producing the argument of the call at {@code insn}: the instruction
+     * just before it. Not across a label something jumps to (as in {@code c ? () -> a : () -> b}),
+     * where the argument comes from more than one place.
+     */
+    private static InvokeDynamicInsnNode precedingIndy(AbstractInsnNode insn, Set<LabelNode> targets) {
         AbstractInsnNode prev = insn.getPrevious();
         while (prev != null) {
             int type = prev.getType();
+            if (type == AbstractInsnNode.LABEL && targets.contains(prev)) {
+                return null;
+            }
             if (type == AbstractInsnNode.LABEL || type == AbstractInsnNode.LINE || type == AbstractInsnNode.FRAME) {
                 prev = prev.getPrevious();
                 continue;
@@ -295,6 +403,28 @@ public final class SidedInliner {
             return prev instanceof InvokeDynamicInsnNode ? (InvokeDynamicInsnNode) prev : null;
         }
         return null;
+    }
+
+    /** Labels control can arrive at other than by falling through: branch, switch and handler targets. */
+    private static Set<LabelNode> branchTargets(MethodNode method) {
+        Set<LabelNode> targets = new HashSet<>();
+        for (AbstractInsnNode insn : method.instructions) {
+            if (insn instanceof JumpInsnNode jump) {
+                targets.add(jump.label);
+            } else if (insn instanceof TableSwitchInsnNode table) {
+                targets.add(table.dflt);
+                targets.addAll(table.labels);
+            } else if (insn instanceof LookupSwitchInsnNode lookup) {
+                targets.add(lookup.dflt);
+                targets.addAll(lookup.labels);
+            }
+        }
+        if (method.tryCatchBlocks != null) {
+            for (TryCatchBlockNode block : method.tryCatchBlocks) {
+                targets.add(block.handler);
+            }
+        }
+        return targets;
     }
 
     /**
@@ -311,27 +441,13 @@ public final class SidedInliner {
         return owner + '.' + name + desc;
     }
 
+    /** The implementation handle of a lambda or method reference; null for any other invokedynamic. */
     private static Handle lambdaImpl(InvokeDynamicInsnNode indy) {
-        if (indy.bsmArgs != null && indy.bsmArgs.length >= 2 && indy.bsmArgs[1] instanceof Handle) {
+        if (indy.bsm != null && LAMBDA_METAFACTORY.equals(indy.bsm.getOwner())
+                && indy.bsmArgs != null && indy.bsmArgs.length >= 2 && indy.bsmArgs[1] instanceof Handle) {
             return (Handle) indy.bsmArgs[1];
         }
         return null;
-    }
-
-    private static int tagToOpcode(int tag) {
-        switch (tag) {
-            case Opcodes.H_INVOKESTATIC:
-                return Opcodes.INVOKESTATIC;
-            case Opcodes.H_INVOKEVIRTUAL:
-                return Opcodes.INVOKEVIRTUAL;
-            case Opcodes.H_NEWINVOKESPECIAL:
-            case Opcodes.H_INVOKESPECIAL:
-                return Opcodes.INVOKESPECIAL;
-            case Opcodes.H_INVOKEINTERFACE:
-                return Opcodes.INVOKEINTERFACE;
-            default:
-                throw new IllegalArgumentException("Unknown handle tag: " + tag);
-        }
     }
 
     /** Finds the first instruction of the expression pushing the consumed slots. */

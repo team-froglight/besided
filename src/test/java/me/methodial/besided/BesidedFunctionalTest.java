@@ -279,6 +279,21 @@ public class BesidedFunctionalTest {
         return false;
     }
 
+    /** True when any method of the class still makes a lambda (string concatenation's invokedynamic aside). */
+    private static boolean hasIndy(byte[] bytes) {
+        ClassNode node = new ClassNode();
+        new ClassReader(bytes).accept(node, 0);
+        for (MethodNode m : node.methods) {
+            for (var insn : m.instructions) {
+                if (insn instanceof org.objectweb.asm.tree.InvokeDynamicInsnNode indy
+                        && indy.bsm.getOwner().equals("java/lang/invoke/LambdaMetafactory")) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
     private static class ClassInspect {
         final Set<String> methods = new HashSet<>();
         final Set<String> fields = new HashSet<>();
@@ -470,6 +485,81 @@ public class BesidedFunctionalTest {
         assertEquals(1, callOnSide("server", "com.example.Shared", "tick"), "server: only the common sync() runs");
         assertEquals(2, callOnSide("client", "com.example.Shared", "tick"), "client: the method reference runs too");
         callOnSide("client", "com.example.Shared", "boot");
+    }
+
+    @Test
+    void lambdasInInterfaceMethodsAreInlinedWithAnInterfaceCall() throws Exception {
+        writeSettings();
+        writeBuild("");
+
+        Path src = testProjectDir.resolve("src/main/java/com/example");
+        // Lambdas in default and static interface methods compile to private (static) methods
+        // of the interface itself, so their direct call must be an interface method call.
+        writeFile(src.resolve("Greeter.java"), """
+                package com.example;
+                import me.methodial.besided.runtime.Sided;
+                public interface Greeter {
+                    String name();
+                    default String greet() { return Sided.getClient(() -> "hi " + name()); }
+                    static String plain() { return Sided.getClient(() -> "plain"); }
+                    default String both() { return greet() + ", " + plain(); }
+                }
+                """);
+        writeFile(src.resolve("Bob.java"), """
+                package com.example;
+                public class Bob implements Greeter {
+                    public String name() { return "bob"; }
+                }
+                """);
+
+        runBuild("buildClient", "buildServer");
+
+        byte[] client = readClassBytes("client", "com/example/Greeter.class");
+        assertFalse(callsSided(client), "every Sided call is rewritten");
+        assertFalse(hasIndy(client), "the call-site lambdas are inlined on the client");
+        assertEquals("hi bob, plain", callOnSide("client", "com.example.Bob", "both"));
+        assertEquals("null, null", callOnSide("server", "com.example.Bob", "both"));
+        ClassInspect server = inspect(readClassBytes("server", "com/example/Greeter.class"));
+        assertTrue(server.methods.stream().noneMatch(m -> m.startsWith("lambda$")),
+                "the client lambdas' bodies are gone from the server");
+    }
+
+    @Test
+    void methodAndConstructorReferencesBecomeInterfaceCalls() throws Exception {
+        writeSettings();
+        writeBuild("");
+
+        Path src = testProjectDir.resolve("src/main/java/com/example");
+        // None of these can be a direct call: the constructor needs NEW/DUP, compute() returns
+        // an int that Supplier.get() boxes, bump()'s int has to be dropped, and the variable
+        // is not a lambda at all.
+        writeFile(src.resolve("Refs.java"), """
+                package com.example;
+                import java.util.function.Supplier;
+                import me.methodial.besided.runtime.Sided;
+                public class Refs {
+                    public int bumps;
+                    public int compute() { return 41 + 1; }
+                    public int bump() { return ++bumps; }
+                    public String run() {
+                        StringBuilder made = Sided.getClient(StringBuilder::new);
+                        Integer value = Sided.getClient(this::compute);
+                        Sided.runClient(this::bump);
+                        Supplier<String> stored = () -> "stored";
+                        String fromVariable = Sided.getClient(stored);
+                        return (made == null ? "none" : "made") + " " + value + " " + bumps + " " + fromVariable;
+                    }
+                }
+                """);
+
+        runBuild("buildClient", "buildServer");
+
+        assertFalse(callsSided(readClassBytes("client", "com/example/Refs.class")), "client: no Sided call left");
+        assertFalse(callsSided(readClassBytes("server", "com/example/Refs.class")), "server: no Sided call left");
+        assertEquals("made 42 1 stored", callOnSide("client", "com.example.Refs", "run"));
+        assertEquals("none null 0 null", callOnSide("server", "com.example.Refs", "run"));
+        ClassInspect server = inspect(readClassBytes("server", "com/example/Refs.class"));
+        assertTrue(server.methods.containsAll(Set.of("compute", "bump")), "method-reference targets stay");
     }
 
     @Test
