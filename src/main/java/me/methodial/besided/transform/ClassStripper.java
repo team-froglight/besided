@@ -92,7 +92,11 @@ public final class ClassStripper {
                 framesNeeded = true;
             }
         }
-        cn.methods.removeIf(m -> SidedInliner.DROP.equals(synth.get(m.name + m.desc)));
+        // Only the lambda bodies javac generated here (synthetic, in this class) go with their
+        // dropped call. A method reference such as `this::sync` or `Other::init` names real code
+        // that is still called from elsewhere, so it stays.
+        cn.methods.removeIf(m -> (m.access & Opcodes.ACC_SYNTHETIC) != 0
+                && SidedInliner.DROP.equals(synth.get(SidedInliner.implKey(cn.name, m.name, m.desc))));
 
         if (EnumRewriter.rewrite(cn, hierarchy, mode)) {
             framesNeeded = true;

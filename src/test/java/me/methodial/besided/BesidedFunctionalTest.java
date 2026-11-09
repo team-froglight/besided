@@ -250,6 +250,35 @@ public class BesidedFunctionalTest {
         return false;
     }
 
+    /** A class loader over one side's strip output, so its classes run as that side's jar holds them. */
+    private URLClassLoader sideLoader(String side) throws IOException {
+        URL dir = testProjectDir.resolve("build/besided/" + side).toUri().toURL();
+        return new URLClassLoader(new URL[]{dir}, BesidedFunctionalTest.class.getClassLoader());
+    }
+
+    /** Calls the public no-argument {@code method} on a new instance of {@code binaryName}, from that side's output. */
+    private Object callOnSide(String side, String binaryName, String method) throws Exception {
+        try (URLClassLoader loader = sideLoader(side)) {
+            Class<?> clazz = Class.forName(binaryName, true, loader);
+            return clazz.getMethod(method).invoke(clazz.getDeclaredConstructor().newInstance());
+        }
+    }
+
+    /** True when any method of the class still calls into {@code Sided}. */
+    private static boolean callsSided(byte[] bytes) {
+        ClassNode node = new ClassNode();
+        new ClassReader(bytes).accept(node, 0);
+        for (MethodNode m : node.methods) {
+            for (var insn : m.instructions) {
+                if (insn instanceof org.objectweb.asm.tree.MethodInsnNode call
+                        && call.owner.equals("me/methodial/besided/runtime/Sided")) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
     private static class ClassInspect {
         final Set<String> methods = new HashSet<>();
         final Set<String> fields = new HashSet<>();
@@ -401,6 +430,46 @@ public class BesidedFunctionalTest {
                 "unmatched resources should be kept on server");
         assertTrue(resourceExists("client", "data/common.json"),
                 "unmatched resources should be kept on client");
+    }
+
+    @Test
+    void methodReferenceTargetsSurviveTheirDroppedCall() throws Exception {
+        writeSettings();
+        writeBuild("");
+
+        Path src = testProjectDir.resolve("src/main/java/com/example");
+        // sync() is shared code that a client-only call also refers to; Other::init has the same
+        // name and descriptor as Shared's own init(), which must not be mistaken for it.
+        writeFile(src.resolve("Shared.java"), """
+                package com.example;
+                import me.methodial.besided.runtime.Sided;
+                public class Shared {
+                    public int synced;
+                    public void sync() { synced++; }
+                    public static void init() { }
+                    public int tick() { Sided.runClient(this::sync); sync(); return synced; }
+                    public void boot() { Sided.runServer(Other::init); init(); }
+                }
+                """);
+        writeFile(src.resolve("Other.java"), """
+                package com.example;
+                public class Other {
+                    public static void init() { }
+                }
+                """);
+
+        runBuild("buildClient", "buildServer");
+
+        ClassInspect server = inspect(readClassBytes("server", "com/example/Shared.class"));
+        assertTrue(server.methods.contains("sync"), "sync() is used by common code and must stay on the server");
+        assertTrue(server.methods.contains("init"), "Shared.init() must stay on the server");
+        ClassInspect client = inspect(readClassBytes("client", "com/example/Shared.class"));
+        assertTrue(client.methods.contains("init"), "Shared.init() must not go with the dropped Other::init");
+        assertTrue(client.methods.contains("sync"), "sync() must stay on the client");
+
+        assertEquals(1, callOnSide("server", "com.example.Shared", "tick"), "server: only the common sync() runs");
+        assertEquals(2, callOnSide("client", "com.example.Shared", "tick"), "client: the method reference runs too");
+        callOnSide("client", "com.example.Shared", "boot");
     }
 
     @Test

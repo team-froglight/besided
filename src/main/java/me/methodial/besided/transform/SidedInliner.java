@@ -31,8 +31,10 @@ import org.objectweb.asm.tree.LdcInsnNode;
  * and erased on the removed side. Non-lambda arguments have no erasure shape that
  * is always safe, so they are left untouched.
  *
- * @param synthToRemove maps synthetic lambda-impl keys ({@code name+descriptor})
- *     to {@code "KEEP"} or {@code "DROP"}; keep always wins over drop
+ * @param synthToRemove maps lambda-impl keys ({@link #implKey}: {@code owner.name+descriptor})
+ *     to {@code "KEEP"} or {@code "DROP"}; keep always wins over drop. Only a synthetic method
+ *     of the class itself is ever deleted for a {@code DROP}: a method reference's target is
+ *     real code that other callers may still use.
  */
 public final class SidedInliner {
     /** Marker stored in {@code synthToRemove} for impls that must survive. */
@@ -170,7 +172,7 @@ public final class SidedInliner {
         if (impl == null) {
             return;
         }
-        synth.put(impl.getName() + impl.getDesc(), KEEP);
+        synth.put(implKey(impl), KEEP);
         MethodInsnNode direct = new MethodInsnNode(
                 tagToOpcode(impl.getTag()), impl.getOwner(), impl.getName(), impl.getDesc(),
                 impl.getTag() == Opcodes.H_INVOKEINTERFACE);
@@ -183,7 +185,7 @@ public final class SidedInliner {
             Map<String, String> synth, boolean pushNull) {
         Handle impl = lambdaImpl(indy);
         if (impl != null) {
-            synth.merge(impl.getName() + impl.getDesc(), DROP, (old, v) -> KEEP.equals(old) ? old : v);
+            synth.merge(implKey(impl), DROP, (old, v) -> KEEP.equals(old) ? old : v);
         }
         for (Type capture : Type.getArgumentTypes(indy.desc)) {
             method.instructions.insertBefore(
@@ -206,7 +208,7 @@ public final class SidedInliner {
                 if (cur instanceof InvokeDynamicInsnNode) {
                     Handle impl = lambdaImpl((InvokeDynamicInsnNode) cur);
                     if (impl != null) {
-                        synth.merge(impl.getName() + impl.getDesc(), DROP,
+                        synth.merge(implKey(impl), DROP,
                                 (old, v) -> KEEP.equals(old) ? old : v);
                     }
                 }
@@ -293,6 +295,20 @@ public final class SidedInliner {
             return prev instanceof InvokeDynamicInsnNode ? (InvokeDynamicInsnNode) prev : null;
         }
         return null;
+    }
+
+    /**
+     * Key of a lambda's implementation in {@code synthToRemove}: {@code owner.name+descriptor}.
+     * The owner is part of it because a method reference may point into another class, whose
+     * same-named method is no business of the class being stripped.
+     */
+    public static String implKey(Handle impl) {
+        return implKey(impl.getOwner(), impl.getName(), impl.getDesc());
+    }
+
+    /** {@link #implKey(Handle)} for a method declared by {@code owner}. */
+    public static String implKey(String owner, String name, String desc) {
+        return owner + '.' + name + desc;
     }
 
     private static Handle lambdaImpl(InvokeDynamicInsnNode indy) {
