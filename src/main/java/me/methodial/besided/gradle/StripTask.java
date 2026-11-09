@@ -4,6 +4,7 @@ import java.io.File;
 import java.io.FileInputStream;
 import java.io.FileOutputStream;
 import java.io.IOException;
+import java.io.InputStream;
 import java.io.OutputStreamWriter;
 import java.io.Writer;
 import java.nio.charset.StandardCharsets;
@@ -15,11 +16,13 @@ import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Set;
 import java.util.zip.ZipEntry;
+import java.util.zip.ZipFile;
 import java.util.zip.ZipInputStream;
 
 import me.methodial.besided.api.RemovalMode;
 import me.methodial.besided.api.Side;
 import me.methodial.besided.core.BesidedSeparator;
+import me.methodial.besided.meta.BesidedMeta;
 import me.methodial.besided.scan.AnnotationRef;
 import me.methodial.besided.scan.ClassScanner;
 import me.methodial.besided.scan.Hierarchy;
@@ -62,12 +65,16 @@ import org.gradle.api.tasks.TaskAction;
  *   <li>{@code AnnotationRef#parse(String)} — {@code "pkg.Annotation"} or {@code "pkg.Annotation:param=VALUE"}.</li>
  * </ul>
  *
- * <p>{@code classpath} and {@code methodCsv} are declared as inputs so stripping
- * stays up-to-date with its dependencies; consuming them inside hierarchy analysis
- * is a hook for a future core revision.
+ * <p>{@code classpath} is read for the {@code META-INF/besided.json} of dependencies built
+ * with besided, whose sided classes and members then count here too (see the hierarchy
+ * step in {@link #strip()}). {@code methodCsv} is declared as an input so stripping stays
+ * up-to-date with it; consuming it is a hook for a future core revision.
  */
 @CacheableTask
 public abstract class StripTask extends DefaultTask {
+    /** Where a jar built with besided keeps its sided metadata. */
+    private static final String META_PATH = "META-INF/besided.json";
+
     /** Classes/resources input (SOURCE_CLASSES mode). Ignored when {@link #getInputJar()} is set. */
     @InputFiles
     @PathSensitive(PathSensitivity.RELATIVE)
@@ -157,6 +164,14 @@ public abstract class StripTask extends DefaultTask {
         for (String pkg : getExcludedPackages().get()) {
             hierarchy.markPackage(toSlashPrefix(pkg), removedSide);
         }
+        // What dependencies built with besided say is sided: a class here extending a library's
+        // client-only class, or overriding its client-only method, goes with it.
+        for (File entry : getClasspath().getFiles()) {
+            BesidedMeta meta = readDependencyMeta(entry);
+            if (meta != null) {
+                meta.applyTo(hierarchy, removedSide);
+            }
+        }
         hierarchy.resolve();
 
         BesidedSeparator separator = new BesidedSeparator(mode, hierarchy, clientAnnots, serverAnnots);
@@ -178,6 +193,41 @@ public abstract class StripTask extends DefaultTask {
             out.add(AnnotationRef.parse(s.trim()));
         }
         return out;
+    }
+
+    /**
+     * The {@code META-INF/besided.json} of one classpath entry (a jar or a classes directory),
+     * or null when it has none. An unreadable entry is skipped with a warning: it can't be
+     * stripped against, but it shouldn't fail the build either.
+     */
+    private BesidedMeta readDependencyMeta(File entry) {
+        try {
+            if (entry.isDirectory()) {
+                File json = new File(entry, META_PATH);
+                if (!json.isFile()) {
+                    return null;
+                }
+                try (InputStream in = new FileInputStream(json)) {
+                    return BesidedMeta.readFrom(in);
+                }
+            }
+            String name = entry.getName().toLowerCase(java.util.Locale.ROOT);
+            if (!entry.isFile() || !(name.endsWith(".jar") || name.endsWith(".zip"))) {
+                return null;
+            }
+            try (ZipFile zip = new ZipFile(entry)) {
+                ZipEntry json = zip.getEntry(META_PATH);
+                if (json == null) {
+                    return null;
+                }
+                try (InputStream in = zip.getInputStream(json)) {
+                    return BesidedMeta.readFrom(in);
+                }
+            }
+        } catch (IOException e) {
+            getLogger().warn("besided: couldn't read {} from {}: {}", META_PATH, entry, e.getMessage());
+            return null;
+        }
     }
 
     private static String toSlashPrefix(String dotPackage) {

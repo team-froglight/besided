@@ -562,6 +562,73 @@ public class BesidedFunctionalTest {
         assertTrue(server.methods.containsAll(Set.of("compute", "bump")), "method-reference targets stay");
     }
 
+    /** A public class with a no-argument constructor and the given empty {@code void} methods. */
+    private static byte[] emptyClass(String name, String superName, String... voidMethods) {
+        org.objectweb.asm.ClassWriter cw = new org.objectweb.asm.ClassWriter(org.objectweb.asm.ClassWriter.COMPUTE_MAXS);
+        cw.visit(Opcodes.V17, Opcodes.ACC_PUBLIC | Opcodes.ACC_SUPER, name, null, superName, null);
+        MethodVisitor init = cw.visitMethod(Opcodes.ACC_PUBLIC, "<init>", "()V", null, null);
+        init.visitCode();
+        init.visitVarInsn(Opcodes.ALOAD, 0);
+        init.visitMethodInsn(Opcodes.INVOKESPECIAL, superName, "<init>", "()V", false);
+        init.visitInsn(Opcodes.RETURN);
+        init.visitMaxs(0, 0);
+        init.visitEnd();
+        for (String method : voidMethods) {
+            MethodVisitor mv = cw.visitMethod(Opcodes.ACC_PUBLIC, method, "()V", null, null);
+            mv.visitCode();
+            mv.visitInsn(Opcodes.RETURN);
+            mv.visitMaxs(0, 0);
+            mv.visitEnd();
+        }
+        cw.visitEnd();
+        return cw.toByteArray();
+    }
+
+    @Test
+    void dependencyMetadataMarksSubclassesAndOverrides() throws Exception {
+        writeSettings();
+        writeBuild("dependencies { implementation files('libs/dep.jar') }");
+
+        // A library built with besided: ClientBase is client-only, and so is Base.render().
+        Path meta = testProjectDir.resolve("dep-meta/besided.json");
+        new me.methodial.besided.meta.BesidedMeta(
+                Set.of(), Set.of(), Set.of("com/dep/ClientBase"), Set.of(),
+                java.util.Map.of("com/dep/Base", Set.of("render()V")), java.util.Map.of()).writeTo(meta);
+        Path jar = testProjectDir.resolve("libs/dep.jar");
+        Files.createDirectories(jar.getParent());
+        try (var out = new java.util.jar.JarOutputStream(Files.newOutputStream(jar))) {
+            out.putNextEntry(new ZipEntry("META-INF/besided.json"));
+            out.write(Files.readAllBytes(meta));
+            out.putNextEntry(new ZipEntry("com/dep/ClientBase.class"));
+            out.write(emptyClass("com/dep/ClientBase", "java/lang/Object"));
+            out.putNextEntry(new ZipEntry("com/dep/Base.class"));
+            out.write(emptyClass("com/dep/Base", "java/lang/Object", "render"));
+        }
+
+        Path src = testProjectDir.resolve("src/main/java/com/example");
+        writeFile(src.resolve("Fancy.java"), """
+                package com.example;
+                public class Fancy extends com.dep.ClientBase { }
+                """);
+        writeFile(src.resolve("Plain.java"), """
+                package com.example;
+                public class Plain extends com.dep.Base {
+                    @Override public void render() { }
+                    public void tick() { }
+                }
+                """);
+
+        runBuild("buildClient", "buildServer");
+
+        assertFalse(classExists("server", "com/example/Fancy.class"),
+                "a subclass of the library's client-only class goes from the server jar");
+        assertTrue(classExists("client", "com/example/Fancy.class"), "and stays in the client jar");
+        ClassInspect server = inspect(readClassBytes("server", "com/example/Plain.class"));
+        assertFalse(server.methods.contains("render"), "an override of a client-only library method goes from the server");
+        assertTrue(server.methods.contains("tick"), "the rest of the class stays");
+        assertTrue(inspect(readClassBytes("client", "com/example/Plain.class")).methods.contains("render"));
+    }
+
     @Test
     void sideMarkerContainsSideName() throws Exception {
         writeSettings();
